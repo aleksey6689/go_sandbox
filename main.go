@@ -5,51 +5,117 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"time"
 
 	"github.com/segmentio/kafka-go"
 )
 
-func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+type jsonErr struct {
+	Error string `json:"error"`
 }
 
-func kafkaWriteHandler(w http.ResponseWriter, r *http.Request) {
-	message := r.URL.Query().Get("message")
-
-	topic := "health-events"
-	partition := 0
+func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
 
-	conn, err := kafka.DialLeader(context.Background(), "tcp", "localhost:9092", topic, partition)
+func recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("panic recovered: %v", rec)
+				writeJSON(w, http.StatusInternalServerError, jsonErr{"internal server error"})
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
 
-	if err != nil {
-		log.Fatal("failed to dial leader:", err)
+func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func kafkaWriteHandler(writer *kafka.Writer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		msg := r.URL.Query().Get("message")
+		if msg == "" {
+			writeJSON(w, http.StatusBadRequest, jsonErr{"missing 'message' query param"})
+			return
+		}
+
+		// Таймаут на запись в Kafka
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		err := writer.WriteMessages(ctx,
+			kafka.Message{
+				// ключ опционален, но полезен для партиционирования
+				Key:   []byte("health"),
+				Value: []byte(msg),
+			},
+		)
+		if err != nil {
+			log.Printf("kafka write error: %v", err)
+			writeJSON(w, http.StatusBadGateway, jsonErr{"kafka write failed"})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]string{"status": "kafka 📝"})
 	}
-
-	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	_, err = conn.WriteMessages(
-		kafka.Message{Value: []byte(message)},
-	)
-
-	if err != nil {
-		log.Fatal("failed to write messages:", err)
-	}
-
-	if err := conn.Close(); err != nil {
-		log.Fatal("failed to close writer:", err)
-	}
-
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "kafka 📝"})
 }
 
 func main() {
-	http.HandleFunc("/health_check", healthCheckHandler)
-	http.HandleFunc("/kafka_write", kafkaWriteHandler)
+	// Адрес брокера и топик можно вытащить из переменных окружения
+	brokers := []string{getEnv("KAFKA_BROKER", "localhost:9092")}
+	topic := getEnv("KAFKA_TOPIC", "health-events")
+
+	writer := &kafka.Writer{
+		Addr:         kafka.TCP(brokers...),
+		Topic:        topic,
+		RequiredAcks: kafka.RequireOne,
+		Balancer:     &kafka.LeastBytes{},
+		Async:        false, // чтобы получать ошибки синхронно
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health_check", healthCheckHandler)
+	mux.Handle("/kafka_write", kafkaWriteHandler(writer))
+
+	srv := &http.Server{
+		Addr:         ":8080",
+		Handler:      recoverMiddleware(mux),
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Грациозное завершение
+	idleConnsClosed := make(chan struct{})
+	go func() {
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt)
+		<-c
+		log.Println("shutting down...")
+
+		_ = srv.Shutdown(context.Background())
+		_ = writer.Close()
+		close(idleConnsClosed)
+	}()
 
 	log.Println("Server is running on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("server error: %v", err)
+	}
+
+	<-idleConnsClosed
+}
+
+func getEnv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
