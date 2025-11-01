@@ -1,0 +1,11 @@
+.git
+.gitignore
+Dockerfile
+*.log
+*.out
+*.swp
+*.DS_Store
+/node_modules
+/bin
+/build
+dist
